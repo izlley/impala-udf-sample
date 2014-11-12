@@ -1,0 +1,424 @@
+// Copyright 2012 Cloudera Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "udf-sample.h"
+
+#include <cctype>
+#include <cmath>
+#include <string>
+#include <stdio.h>
+#include <openssl/rsa.h>
+#include <openssl/crypto.h>
+#include <openssl/err.h>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+
+
+#define SetKey \
+  BN_dec2bn(&(key->n), (const char *)n);\
+  BN_dec2bn(&(key->e), (const char *)e);\
+  BN_dec2bn(&(key->d), (const char *)d);\
+  key->p = NULL; \
+  key->q = NULL; \
+  key->dmp1 = NULL; \
+  key->dmq1 = NULL; \
+  key->iqmp = NULL;
+
+#define SetKey2 \
+  key->n = BN_bin2bn(n, sizeof(n)-1, key->n); \
+  key->e = BN_bin2bn(e, sizeof(e)-1, key->e); \
+  key->d = BN_bin2bn(d, sizeof(d)-1, key->d); \
+  key->p = BN_bin2bn(p, sizeof(p)-1, key->p); \
+  key->q = BN_bin2bn(q, sizeof(q)-1, key->q); \
+  key->dmp1 = BN_bin2bn(dmp1, sizeof(dmp1)-1, key->dmp1); \
+  key->dmq1 = BN_bin2bn(dmq1, sizeof(dmq1)-1, key->dmq1); \
+  key->iqmp = BN_bin2bn(iqmp, sizeof(iqmp)-1, key->iqmp);
+
+#define RSA_KEY_SIZE          64
+#define ENCKEY512_BASE64_SIZE 88
+#define ENC_BLK_NUM_LIMIT     78
+#define DATA_PER_ENCBLK_SIZE  53
+#define MAX_DECDATA_SIZE      (DATA_PER_ENCBLK_SIZE * ENC_BLK_NUM_LIMIT)
+
+static void key1(RSA *key);
+static RSA *initializeRSAKey();
+
+///should be secured///
+static unsigned char pub_modulus[] = "7577257274191551097624277939619648834415258346195701624702241427507596352378240942764032510385901727639861216319309817735955405453593241345706416751624437";
+static unsigned char pub_exp[] = "65537";
+static unsigned char pri_exp[] = ""; 
+//static RSA *gRSAKey = initializeRSAKey();
+///////////////////////
+
+static void key1(RSA *key) {
+  // public modulus
+  static unsigned char* n = pub_modulus;
+  // public exponent
+  static unsigned char* e = pub_exp;
+  // private exponent
+  static unsigned char* d = pri_exp;
+  static unsigned char p[] = "";
+  static unsigned char q[] = "";
+  static unsigned char dmp1[] = "";
+  static unsigned char dmq1[] = "";
+  static unsigned char iqmp[] = "";
+  static unsigned char ctext_ex[] = "";
+  SetKey;
+}
+
+static RSA *initializeRSAKey() {
+  static RSA *key = RSA_new();
+  (void)key1(key); 
+  return key;
+}
+
+int calcDecodeLength(const char* b64input, int len) { //Calculates the length of a decoded base64 string
+  int padding = 0;
+ 
+  if (b64input[len-1] == '=' && b64input[len-2] == '=') //last two chars are =
+    padding = 2;
+  else if (b64input[len-1] == '=') //last char is =
+    padding = 1;
+ 
+  return (int)len*0.75 - padding;
+}
+
+int Base64Encode(char *data, char* buffer, int len) {
+  int writelen;
+  BIO *bio, *b64;
+  b64 = BIO_new(BIO_f_base64());
+  FILE* stream = fmemopen(buffer, ENCKEY512_BASE64_SIZE + 1, "w");
+  bio = BIO_new_fp(stream, BIO_NOCLOSE);
+  BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL); //Do not use newlines to flush buffer
+  BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL); //Do not use newlines to flush buffer
+
+  BIO_push(b64, bio);
+  writelen = BIO_write(b64, data, len);
+  if (writelen < 0) {
+    writelen = -1;
+  } else {
+    (buffer)[writelen] = '\0';
+  }
+  BIO_flush(b64);
+  BIO_free_all(b64);
+  fclose(stream);
+
+  return writelen;
+}
+ 
+int Base64Decode(char* b64message, char* buffer, int len) { //Decodes a base64 encoded string
+  BIO *bio, *b64;
+  int decodeLen = calcDecodeLength(b64message, len);
+  FILE* stream = fmemopen(b64message, len, "r");
+ 
+  b64 = BIO_new(BIO_f_base64());
+  bio = BIO_new_fp(stream, BIO_NOCLOSE);
+  bio = BIO_push(b64, bio);
+  BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL); //Do not use newlines to flush buffer
+  len = BIO_read(bio, buffer, len);
+  if (len != decodeLen || len < 0) {
+    //test here if len == decodeLen - if not, then return an error
+    len = -1;
+  } else {
+    (buffer)[len] = '\0';
+  }
+  BIO_free_all(b64);
+  fclose(stream);
+ 
+  return len; //success
+}
+
+StringVal RSAPublicEncryption(FunctionContext* context, const StringVal& input) {
+  if (input.is_null || input.len == 0) return StringVal("");
+  if (input.len > ENC_BLK_NUM_LIMIT * DATA_PER_ENCBLK_SIZE) {
+    context->AddWarning("Encryption failed with too large data length (>4134)"); 
+    return StringVal("##Encryption failed");
+  }
+
+  RSA *key = RSA_new();
+  (void)key1(key); 
+  RSA_blinding_off(key);
+
+  unsigned char encdatablk[RSA_KEY_SIZE + 1];
+  unsigned char encdatablk2[RSA_KEY_SIZE + 1];
+  unsigned char base64str[ENCKEY512_BASE64_SIZE + 1];
+  unsigned char encdata[ENCKEY512_BASE64_SIZE * ENC_BLK_NUM_LIMIT + 1];
+  char *encStr = NULL, *srcStr = NULL;
+  int len, enlen, base64len;
+  int readBytes, totReadBytes = 0;
+  int offset = 0;
+  len = input.len;
+
+  while (len > 0) {
+    // 1. copy the public modulus string to a encrypted data block
+    memcpy(encdatablk, pub_modulus, RSA_KEY_SIZE);
+    encdatablk[RSA_KEY_SIZE] = '\0';
+
+    if (len > DATA_PER_ENCBLK_SIZE) {
+      readBytes = DATA_PER_ENCBLK_SIZE;
+    } else {
+      readBytes = len;
+    }
+
+    // 2. copy src data to the encrypted data block with right-aligned
+    memcpy(encdatablk + (RSA_KEY_SIZE - readBytes),
+           input.ptr + totReadBytes,
+           readBytes);
+    encdatablk[RSA_KEY_SIZE - readBytes - 1] = (unsigned char)0x0C;
+
+    // 3. encrypt data
+    // enlen should be equal to RSA_KEY_SIZE
+    enlen = RSA_public_encrypt(RSA_KEY_SIZE, encdatablk, encdatablk2, key,
+                               RSA_NO_PADDING);
+    if (enlen != RSA_KEY_SIZE) { // error
+      enlen = -1;
+      break;
+    } 
+ 
+    // 4. encode the encblk to base64 array => 88 bytes blk
+    base64len = Base64Encode((char *)encdatablk2, (char *)base64str, enlen);
+    if (base64len != ENCKEY512_BASE64_SIZE && base64len != RSA_KEY_SIZE) { // error
+      base64len = -1;
+      break;
+    } else {
+      if (base64len == RSA_KEY_SIZE)
+        base64len = ENCKEY512_BASE64_SIZE;
+    }
+
+    // 5. append the base64 array to encdata
+    memcpy(encdata + offset, base64str, base64len);
+    offset += base64len;
+    totReadBytes += readBytes;
+    len -= readBytes;
+  }
+
+  //CRYPTO_cleanup_all_ex_data();
+  ERR_remove_thread_state(NULL);
+
+  //printf("debug: offset=%d, dtext=%s\n", offset, dtext);
+
+  if (enlen == RSA_KEY_SIZE && base64len == ENCKEY512_BASE64_SIZE) {
+    if (offset == 0)
+      return StringVal("");
+    // impala bug
+    //StringVal result(context, offset);
+    //memcpy(result.ptr, encdata, offset);
+    uint8_t* buffer =
+      reinterpret_cast<uint8_t*>(context->GetFunctionState(FunctionContext::THREAD_LOCAL));
+    memcpy(buffer, encdata, offset);
+    StringVal result(buffer, offset);
+    return result;
+  } else {
+    // on format error
+    char errmsg[1024];
+    int  cpylen = input.len, errmsglen;
+    strcpy(errmsg, "Encryption failed with invalid data format: ");
+    errmsglen = strlen(errmsg);
+    if (errmsglen + input.len >= 1024)
+      cpylen = 1024 - errmsglen - 1;
+    memcpy(errmsg + errmsglen, input.ptr, cpylen);
+    errmsg[errmsglen + cpylen] = '\0';
+    context->AddWarning((char *)errmsg); 
+    return StringVal("##decryption failed");
+  }
+}
+
+
+StringVal RSAPrivateDecryption(FunctionContext* context, const StringVal& input) {
+  if (input.is_null || input.len == 0) return StringVal("");
+  if (input.len > ENC_BLK_NUM_LIMIT * ENCKEY512_BASE64_SIZE) {
+    context->AddWarning("Decryption failed with too large encrypted data length (>6864)"); 
+    return StringVal("##decryption failed");
+  }
+
+  RSA *key = RSA_new();
+  (void)key1(key); 
+  RSA_blinding_off(key);
+
+  unsigned char mtext[256];
+  unsigned char dtext[MAX_DECDATA_SIZE + 1] = {0};
+  unsigned char base64str[ENCKEY512_BASE64_SIZE + 1];
+  unsigned char encstr[256];
+  int len, plen, enclen;
+  int readBytes, totReadBytes = 0;
+  int start, offset = 0;
+  len = input.len;
+
+  if (input.len % ENCKEY512_BASE64_SIZE != 0)
+    goto _DECRYPT_FORMAT_ERR; 
+
+  while (len > 0) {
+    if (len >= ENCKEY512_BASE64_SIZE) {
+      readBytes = ENCKEY512_BASE64_SIZE;
+      memcpy(base64str, input.ptr + totReadBytes, readBytes);
+      base64str[readBytes] = '\0';
+    } else { // error
+      goto _DECRYPT_FORMAT_ERR;
+    }
+    totReadBytes += readBytes;
+
+    enclen = Base64Decode((char *)base64str, (char *)encstr, ENCKEY512_BASE64_SIZE);
+    if (enclen != RSA_KEY_SIZE)
+      goto _DECRYPT_FORMAT_ERR; 
+    // plen should be equal to RSA_KEY_SIZE
+    plen = RSA_private_decrypt(enclen, encstr, mtext, key,
+                               RSA_NO_PADDING);
+    if (plen != RSA_KEY_SIZE) {
+      plen = -1;
+      break;
+    }
+    start = plen; 
+    for (int i = plen - 1; i >= 0; i--) {
+      if (mtext[i] == (unsigned char)0x0C) {
+        start = i + 1;
+        break;
+      }
+    } 
+
+    memcpy(dtext + offset, mtext + start, plen - start);
+    offset += (plen - start);
+    len -= readBytes;
+  }
+
+  //CRYPTO_cleanup_all_ex_data();
+  ERR_remove_thread_state(NULL);
+
+  //printf("debug: offset=%d, dtext=%s\n", offset, dtext);
+
+  if (plen == RSA_KEY_SIZE && enclen == RSA_KEY_SIZE) {
+    if (offset == 0)
+      return StringVal("");
+    uint8_t* buffer =
+      reinterpret_cast<uint8_t*>(context->GetFunctionState(FunctionContext::THREAD_LOCAL));
+    memcpy(buffer, dtext, offset);
+    StringVal result(buffer, offset);
+    //impala bug
+    //StringVal result(context, offset);
+    //memcpy(result.ptr, dtext, offset);
+    return result;
+  } else {
+_DECRYPT_FORMAT_ERR:
+    // on format error
+    char errmsg[1024];
+    int  cpylen = input.len, errmsglen;
+    strcpy(errmsg, "Decryption failed with unknown data format: ");
+    errmsglen = strlen(errmsg);
+    if (errmsglen + input.len >= 1024)
+      cpylen = 1024 - errmsglen - 1;
+    memcpy(errmsg + errmsglen, input.ptr, cpylen);
+    errmsg[errmsglen + cpylen] = '\0';
+    context->AddWarning((char *)errmsg); 
+    return StringVal("##decryption failed");
+  }
+}
+
+void CryptoPrepare(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope == FunctionContext::THREAD_LOCAL) {
+    // Allocate shared state to store 'arg' or a null IntVal
+    uint8_t* state = context->Allocate(ENC_BLK_NUM_LIMIT * ENCKEY512_BASE64_SIZE);
+    memset(state, 0x00, ENC_BLK_NUM_LIMIT * ENCKEY512_BASE64_SIZE);
+    // Set the shared state in the function context
+    context->SetFunctionState(scope, (void*)state);
+  }
+}
+
+void CryptoClose(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope == FunctionContext::THREAD_LOCAL) {
+    context->Free(reinterpret_cast<uint8_t*>(context->GetFunctionState(scope)));
+    context->SetFunctionState(scope, NULL);
+  }
+}
+
+
+// In this sample we are declaring a UDF that adds two ints and returns an int.
+IntVal AddUdf(FunctionContext* context, const IntVal& arg1, const IntVal& arg2) {
+  if (arg1.is_null || arg2.is_null) return IntVal::null();
+  return IntVal(arg1.val + arg2.val);
+}
+
+#define UNIT_X 408
+#define UNIT_Y 324
+
+StringVal FindInnerposInSet(FunctionContext* context, const FloatVal& x, const FloatVal& y,
+  const StringVal& pos_set, const IntVal& radius, const IntVal& find_num) {
+  if (x.is_null || y.is_null || pos_set.is_null || radius.is_null)
+    return StringVal::null();
+  char tmp_x[21];
+  char tmp_y[21];
+  int32_t pos_index = 1;
+  int32_t start = 0;
+  int32_t end;
+  int32_t res_find[find_num.val];
+  int32_t res_index = 0;
+  double pos_x = 0., pos_y = 0.;
+
+  memset(tmp_x, 0x00, 21);
+  memset(tmp_y, 0x00, 21);
+
+  //debug
+  //std::cout << "arg1:" << x.val << ", arg2:" << y.val << ", arg3:" << pos_set.ptr << ", arg4:" << radius.val << ", arg5:" << find_num.val << '\n'; 
+
+  do {
+    if (find_num.val <= res_index) break;
+    end = start;
+    while(pos_set.ptr[end] != ':' && end < pos_set.len) ++end;
+    if (end - start > 20)
+      context->SetError("The x-coordinate string size should less than 20.");
+    memcpy(tmp_x, pos_set.ptr + start, end - start);
+    tmp_x[end - start] = '\0';
+    pos_x = atof(tmp_x);
+    //debug
+    //std::cout << "x in set: " << pos_x << '\n';
+    start = end + 1;
+
+    end = start;
+    while(pos_set.ptr[end] != ',' && end < pos_set.len) ++end;
+    if (end - start > 20)
+      context->SetError("The y-coordinate string size should less than 20.");
+    memcpy(tmp_y, pos_set.ptr + start, end - start);
+    tmp_y[end - start] = '\0';
+    pos_y = atof(tmp_y);
+    //debug
+    //std::cout << "y in set: " << pos_y << '\n';
+    start = end + 1;
+
+    if (((pos_x - (double)UNIT_X * radius.val < x.val) && (x.val < pos_x + (double)UNIT_X * radius.val)) &&
+        ((pos_y - (double)UNIT_Y * radius.val < y.val) && (y.val < pos_y + (double)UNIT_Y * radius.val))) {
+      res_find[res_index++] = pos_index;
+      //debug
+      //std::cout << "res_index:" << res_index << ", pos_index:" << pos_index << '\n';
+    }
+    ++pos_index;
+  } while (start < pos_set.len);
+
+  if (res_index == 0) return StringVal::null(); 
+  char result_str[34 * res_index];
+  int offset = 0;
+  for (int i = 0; i < res_index; i++) {
+    sprintf((char *)(result_str + offset), "%d", res_find[i]);
+    int len = strlen((char *)(result_str + offset));
+    offset += len;
+    if (i != res_index - 1) {
+      memcpy(result_str + offset, ",", 1);
+      ++offset;
+    }
+  }
+  result_str[offset] = '\0';
+  //debug
+  //std::cout << "result_str:" << result_str << ", offset:" << offset << '\n';
+  StringVal result = StringVal(context, offset); 
+  memcpy(result.ptr, result_str, offset);
+  return result; 
+}
+
